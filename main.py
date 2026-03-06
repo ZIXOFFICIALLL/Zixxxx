@@ -865,8 +865,10 @@ class Proxy:
         emote_id = emote_list.get(str(emote_number), '909000063')
         print(f"[DENS] Emote {emote_number} -> ID: {emote_id}")
         return emote_id        
-    def check_firebase_code(self, code):
-        """التحقق من صحة كود التفعيل من Firebase"""
+
+        
+    def check_firebase_code(self, code, user_id):
+        """التحقق من صحة كود التفعيل من Firebase مع ربطه بالمستخدم"""
         try:
             # رابط Firebase للأكواد
             url = f"https://zixoff-default-rtdb.firebaseio.com/codes/{code}.json"
@@ -885,78 +887,273 @@ class Proxy:
                     expire = data.get('expire')
                     used_count = data.get('used_count', 0)
                     limit = data.get('limit', 0)
+                    activated_users = data.get('activated_users', [])  # قائمة المستخدمين المفعلين بهذا الكود
                     
                     # التحقق من الصلاحية
                     if expire and int(datetime.now().timestamp()) > int(expire):
                         print(f"[FIREBASE] Code {code} expired")
-                        return {"valid": False, "reason": "expired"}
+                        return {"valid": False, "reason": "expired", "message": "❌ هذا الكود منتهي الصلاحية"}
                     
-                    # التحقق من الحد الأقصى
-                    if used_count >= limit:
-                        print(f"[FIREBASE] Code {code} reached limit")
-                        return {"valid": False, "reason": "limit_reached"}
+                    # التحقق مما إذا كان المستخدم قد استخدم الكود من قبل
+                    if str(user_id) in activated_users:
+                        print(f"[FIREBASE] User {user_id} already used this code")
+                        return {"valid": True, "expire": datetime.fromtimestamp(int(expire)).strftime('%Y-%m-%d %H:%M:%S'), "already_activated": True}
                     
-                    # كود صالح
-                    expire_date = datetime.fromtimestamp(int(expire)).strftime('%Y-%m-%d %H:%M:%S')
-                    return {"valid": True, "expire": expire_date}
+                    # التحقق من الحد الأقصى للمستخدمين
+                    if len(activated_users) >= limit:
+                        print(f"[FIREBASE] Code {code} reached maximum users limit ({limit})")
+                        return {"valid": False, "reason": "max_users_reached", "message": f"❌ هذا الكود وصل للحد الأقصى من المستخدمين ({limit})"}
+                    
+                    # كود صالح - زيادة عدد المستخدمين
+                    activated_users.append(str(user_id))
+                    new_used_count = len(activated_users)
+                    
+                    # تحديث البيانات في Firebase
+                    update_success = self.update_code_activation(code, activated_users, new_used_count)
+                    
+                    if update_success:
+                        expire_date = datetime.fromtimestamp(int(expire)).strftime('%Y-%m-%d %H:%M:%S')
+                        return {
+                            "valid": True, 
+                            "expire": expire_date,
+                            "message": f"✅ تم تفعيل الكود بنجاح!\n📅 تاريخ الانتهاء: {expire_date}\n👥 عدد المستخدمين: {new_used_count}/{limit}"
+                        }
+                    else:
+                        return {"valid": False, "reason": "error", "message": "❌ حدث خطأ في حفظ البيانات"}
                 else:
                     print(f"[FIREBASE] Code {code} invalid structure")
-                    return {"valid": False, "reason": "invalid"}
+                    return {"valid": False, "reason": "invalid", "message": "❌ كود غير صالح"}
             else:
                 print(f"[FIREBASE] Error: {response.status_code}")
-                return {"valid": False, "reason": "error"}
+                return {"valid": False, "reason": "error", "message": "❌ حدث خطأ في الاتصال"}
         except Exception as e:
             print(f"[FIREBASE] Exception: {e}")
-            return {"valid": False, "reason": "error"}
+            return {"valid": False, "reason": "error", "message": "❌ حدث خطأ في النظام"}
 
-    def save_activated_user(self, user_id, expire_date):
-        """حفظ معرف المستخدم المفعل وتاريخ انتهاء الصلاحية"""
+    def update_code_activation(self, code, activated_users, used_count):
+        """تحديث بيانات الكود بعد تفعيل مستخدم جديد"""
         try:
-            # قراءة الملف الموجود
-            activated_users = {}
-            if os.path.exists('activated_users.json'):
-                try:
-                    with open('activated_users.json', 'r') as f:
-                        activated_users = json.load(f)
-                except:
-                    activated_users = {}
+            # تحديث قائمة المستخدمين المفعلين
+            users_url = f"https://zixoff-default-rtdb.firebaseio.com/codes/{code}/activated_users.json"
+            users_response = requests.put(users_url, json=activated_users, timeout=10)
             
-            # إضافة المستخدم مع تاريخ الانتهاء
-            activated_users[user_id] = expire_date
+            # تحديث عدد المستخدمين
+            count_url = f"https://zixoff-default-rtdb.firebaseio.com/codes/{code}/used_count.json"
+            count_response = requests.put(count_url, json=used_count, timeout=10)
             
-            # حفظ الملف
-            with open('activated_users.json', 'w') as f:
-                json.dump(activated_users, f, indent=2)
-            
-            print(f"[ACTIVATION] User {user_id} saved with expiry {expire_date}")
-            return True
+            if users_response.status_code == 200 and count_response.status_code == 200:
+                print(f"[FIREBASE] Code {code} updated with new user. Total users: {used_count}")
+                
+                # حفظ المستخدم في قائمة المستخدمين المفعلين مع الكود الخاص به
+                self.save_user_code_mapping(activated_users[-1], code, used_count)
+                
+                return True
+            else:
+                print(f"[FIREBASE] Error updating code: Users={users_response.status_code}, Count={count_response.status_code}")
+                return False
         except Exception as e:
-            print(f"[ACTIVATION] Error saving user: {e}")
+            print(f"[FIREBASE] Error updating code activation: {e}")
+            return False
+
+    def save_user_code_mapping(self, user_id, code, total_users):
+        """حفظ علاقة المستخدم بالكود في Firebase"""
+        try:
+            # حفظ في مسار user_codes
+            url = f"https://zixoff-default-rtdb.firebaseio.com/user_codes/{user_id}.json"
+            
+            # جلب بيانات الكود للحصول على تاريخ الانتهاء
+            code_url = f"https://zixoff-default-rtdb.firebaseio.com/codes/{code}.json"
+            code_response = requests.get(code_url, timeout=10)
+            
+            expire_date = "غير محدد"
+            if code_response.status_code == 200:
+                code_data = code_response.json()
+                if code_data and 'expire' in code_data:
+                    expire_date = datetime.fromtimestamp(int(code_data['expire'])).strftime('%Y-%m-%d %H:%M:%S')
+            
+            user_data = {
+                "user_id": user_id,
+                "code": code,
+                "activated_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "expire_date": expire_date,
+                "total_users_for_this_code": total_users
+            }
+            
+            response = requests.put(url, json=user_data, timeout=10)
+            
+            if response.status_code == 200:
+                print(f"[FIREBASE] User {user_id} mapped to code {code}")
+                return True
+            else:
+                print(f"[FIREBASE] Error mapping user to code: {response.status_code}")
+                return False
+        except Exception as e:
+            print(f"[FIREBASE] Error in save_user_code_mapping: {e}")
+            return False
+
+    def save_activated_user(self, user_id, expire_date, code=None):
+        """حفظ معرف المستخدم المفعل وتاريخ انتهاء الصلاحية مع الكود المستخدم"""
+        try:
+            # رابط Firebase للمستخدمين المفعلين
+            url = f"https://zixoff-default-rtdb.firebaseio.com/activated_users/{user_id}.json"
+            
+            # بيانات المستخدم المفعل
+            user_data = {
+                "user_id": user_id,
+                "expire_date": expire_date,
+                "activated_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "expire_timestamp": int(datetime.strptime(expire_date, '%Y-%m-%d %H:%M:%S').timestamp()) if expire_date else 0,
+                "activation_code": code  # حفظ الكود المستخدم
+            }
+            
+            # حفظ البيانات في Firebase
+            response = requests.put(url, json=user_data, timeout=10)
+            
+            if response.status_code == 200:
+                print(f"[FIREBASE] User {user_id} saved with expiry {expire_date} using code {code}")
+                return True
+            else:
+                print(f"[FIREBASE] Error saving user: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            print(f"[FIREBASE] Error saving user to Firebase: {e}")
             return False
 
     def is_user_activated(self, user_id):
-        """التحقق مما إذا كان المستخدم مفعلاً مسبقاً"""
+        """التحقق مما إذا كان المستخدم مفعلاً مسبقاً من Firebase"""
         try:
-            if not os.path.exists('activated_users.json'):
+            # رابط Firebase للمستخدمين المفعلين
+            url = f"https://zixoff-default-rtdb.firebaseio.com/activated_users/{user_id}.json"
+            
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                user_data = response.json()
+                
+                # التحقق من وجود المستخدم
+                if not user_data:
+                    return False
+                
+                # التحقق من وجود تاريخ انتهاء
+                expire_date = user_data.get('expire_date')
+                if not expire_date:
+                    return False
+                
+                # التحقق من انتهاء الصلاحية
+                try:
+                    expire_datetime = datetime.strptime(expire_date, '%Y-%m-%d %H:%M:%S')
+                    if datetime.now() > expire_datetime:
+                        print(f"[FIREBASE] User {user_id} has expired")
+                        # حذف المستخدم المنتهي صلاحيته تلقائياً
+                        self.remove_expired_user(user_id)
+                        return False
+                except Exception as e:
+                    print(f"[FIREBASE] Error checking expiry: {e}")
+                
+                return True
+            else:
+                print(f"[FIREBASE] Error checking user: {response.status_code}")
                 return False
-            
-            with open('activated_users.json', 'r') as f:
-                activated_users = json.load(f)
-            
-            # التحقق من وجود المستخدم
-            if user_id not in activated_users:
-                return False
-            
-            # التحقق من تاريخ الانتهاء
-            expire_date = activated_users[user_id]
-            # إذا كان التخزين بصيغة نصية، نقارن ببساطة
-            # ملاحظة: يمكن تحسين هذا الجزء حسب الحاجة
-            return True
+                
         except Exception as e:
-            print(f"[ACTIVATION] Error checking user: {e}")
+            print(f"[FIREBASE] Error checking user in Firebase: {e}")
             return False
 
+    def remove_expired_user(self, user_id):
+        """حذف المستخدم المنتهي صلاحيته من Firebase"""
+        try:
+            url = f"https://zixoff-default-rtdb.firebaseio.com/activated_users/{user_id}.json"
+            response = requests.delete(url, timeout=10)
+            
+            if response.status_code == 200:
+                print(f"[FIREBASE] Expired user {user_id} removed")
+                return True
+        except Exception as e:
+            print(f"[FIREBASE] Error removing expired user: {e}")
+            return False
+
+    def get_all_activated_users(self):
+        """جلب جميع المستخدمين المفعلين من Firebase"""
+        try:
+            url = "https://zixoff-default-rtdb.firebaseio.com/activated_users.json"
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                return response.json() or {}
+            else:
+                return {}
+        except Exception as e:
+            print(f"[FIREBASE] Error getting all users: {e}")
+            return {}
+
+    def check_expired_users(self):
+        """التحقق من المستخدمين المنتهية صلاحيتهم وإزالتهم"""
+        try:
+            activated_users = self.get_all_activated_users()
+            current_time = datetime.now()
+            
+            for user_id, user_data in activated_users.items():
+                expire_date = user_data.get('expire_date')
+                if expire_date:
+                    try:
+                        expire_datetime = datetime.strptime(expire_date, '%Y-%m-%d %H:%M:%S')
+                        if current_time > expire_datetime:
+                            self.remove_expired_user(user_id)
+                            print(f"[FIREBASE] User {user_id} automatically removed (expired)")
+                    except Exception as e:
+                        print(f"[FIREBASE] Error processing user {user_id}: {e}")
+                        
+        except Exception as e:
+            print(f"[FIREBASE] Error in check_expired_users: {e}")
+
+    def start_expiry_checker(self):
+        """بدء مهمة دورية للتحقق من انتهاء الصلاحيات"""
+        def check_periodically():
+            while True:
+                try:
+                    self.check_expired_users()
+                    # التحقق كل ساعة
+                    time.sleep(3600)
+                except Exception as e:
+                    print(f"[FIREBASE] Error in expiry checker: {e}")
+                    time.sleep(3600)
+        
+        # بدء المهمة في خيط منفصل
+        import threading
+        thread = threading.Thread(target=check_periodically, daemon=True)
+        thread.start()
+
+    def get_code_info(self, code):
+        """جلب معلومات كود معين"""
+        try:
+            url = f"https://zixoff-default-rtdb.firebaseio.com/codes/{code}.json"
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return None
+        except Exception as e:
+            print(f"[FIREBASE] Error getting code info: {e}")
+            return None
+
+    def get_user_code(self, user_id):
+        """جلب الكود الذي استخدمه المستخدم"""
+        try:
+            url = f"https://zixoff-default-rtdb.firebaseio.com/user_codes/{user_id}.json"
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return None
+        except Exception as e:
+            print(f"[FIREBASE] Error getting user code: {e}")
+            return None
+
     def send_not_activated_message(self, user_id):
+        """إرسال رسالة عدم التفعيل"""
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         msg = f"""[b][c][FF0000]════════════════════════════════════════
 ✗ البوت غير مفعل
@@ -967,7 +1164,82 @@ class Proxy:
 
 مثال: @help ZIX-CTX-64TE-AM95
 [FF0000]════════════════════════════════════════"""
-        threading.Thread(target=self.gen_zixhelp, args=(user_id, msg)).start()        
+        threading.Thread(target=self.gen_zixhelp, args=(user_id, msg)).start()
+
+    def handle_activation_command(self, user_id, code):
+        """معالجة أمر التفعيل - استدعها من بوت التليجرام"""
+        result = self.check_firebase_code(code, user_id)
+        
+        if result["valid"]:
+            if result.get("already_activated"):
+                # المستخدم مفعل مسبقاً بهذا الكود
+                msg = "✅ حسابك مفعل بالفعل بهذا الكود!"
+            else:
+                # تفعيل جديد
+                msg = result["message"]
+                # حفظ المستخدم كمفعل
+                self.save_activated_user(user_id, result["expire"], code)
+        else:
+            # فشل التفعيل
+            msg = result["message"]
+        
+        return msg
+
+    def handle_create_code_command(self, admin_id, code, limit, expire_days):
+        """إنشاء كود جديد (للآدمن فقط) - استدعها من بوت التليجرام"""
+        try:
+            expire_timestamp = int((datetime.now() + timedelta(days=expire_days)).timestamp())
+            
+            code_data = {
+                "expire": expire_timestamp,
+                "limit": limit,
+                "used_count": 0,
+                "activated_users": [],
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "created_by": admin_id
+            }
+            
+            url = f"https://zixoff-default-rtdb.firebaseio.com/codes/{code}.json"
+            response = requests.put(url, json=code_data)
+            
+            if response.status_code == 200:
+                return f"✅ تم إنشاء الكود بنجاح!\n📌 الكود: {code}\n👥 الحد الأقصى: {limit}\n📅 ينتهي بعد: {expire_days} يوم"
+            else:
+                return "❌ فشل في إنشاء الكود"
+        except Exception as e:
+            print(f"[FIREBASE] Error creating code: {e}")
+            return "❌ حدث خطأ في إنشاء الكود"
+
+    def handle_check_code_command(self, code):
+        """التحقق من معلومات كود معين - استدعها من بوت التليجرام"""
+        code_info = self.get_code_info(code)
+        
+        if code_info:
+            expire_date = datetime.fromtimestamp(int(code_info['expire'])).strftime('%Y-%m-%d %H:%M:%S')
+            used = code_info.get('used_count', 0)
+            limit = code_info.get('limit', 0)
+            activated_users = code_info.get('activated_users', [])
+            
+            msg = f"""📌 معلومات الكود: {code}
+📅 تاريخ الانتهاء: {expire_date}
+👥 المستخدمون: {used}/{limit}
+👤 قائمة المستخدمين: {', '.join(activated_users) if activated_users else 'لا يوجد'}"""
+            return msg
+        else:
+            return "❌ الكود غير موجود"
+
+    #################################
+
+    def spam__invite(self, data, remote):
+        global invit_spam
+        while invit_spam:
+            try:
+                for _ in range(5):
+                    remote.send(data)
+                    time.sleep(0.04)
+                time.sleep(0.2)
+            except:
+                pass    
                               
     def likes_command(self, data):
         try:
