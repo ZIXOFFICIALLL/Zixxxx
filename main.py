@@ -10,6 +10,10 @@ import random
 import os
 from datetime import datetime, timedelta
 import json
+import requests
+from datetime import datetime, timedelta
+import time
+import threading
 #################################
 
 RbGx = False
@@ -3218,7 +3222,7 @@ class Proxy:
                                 threading.Thread(target=self.gen_zixhelp, args=(user_id, wait_msg)).start()
                                 
                                 # التحقق من الكود
-                                result = self.check_firebase_code(code)
+                                result = self.check_firebase_code(code, user_id)
                                 
                                 if result["valid"]:
                                     # تفعيل المستخدم وحفظه مع تاريخ الانتهاء
